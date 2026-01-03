@@ -1,24 +1,32 @@
 package vpn
 
 import (
-	"crypto/tls" // <--- ADD THIS
+	"crypto/tls"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
-	"net/netip" // <--- NEW: Required by latest wireguard-go
+	"net/netip"
 	"sync"
 
 	"github.com/gorilla/websocket"
 	"golang.zx2c4.com/wireguard/conn"
 )
 
+const Stunbyte uint32 = 0x2112A442
+const MagicProbeSig uint32 = 0xFF505242
+
 // HybridBind handles BOTH UDP (P2P) and WebSocket (Relay)
 type HybridBind struct {
-	udpConn *net.UDPConn
-	wsConn  *websocket.Conn
-	wsLock  sync.Mutex
-	rxChan  chan Packet
+	udpConn     *net.UDPConn
+	wsConn      *websocket.Conn
+	wsLock      sync.Mutex
+	rxChan      chan Packet
+	ControlChan chan Packet
+	StunRxChan  chan Packet
+
+	UpdatePeerEndpoint func(peerKeyHex string, newAddr *net.UDPAddr)
 }
 
 type Packet struct {
@@ -28,7 +36,9 @@ type Packet struct {
 
 func NewHybridBind(listenPort int, relayURL string, myPubKey string) (*HybridBind, error) {
 	b := &HybridBind{
-		rxChan: make(chan Packet, 1024),
+		rxChan:      make(chan Packet, 1024),
+		ControlChan: make(chan Packet, 1024),
+		StunRxChan:  make(chan Packet, 1024),
 	}
 
 	// 1. Setup UDP
@@ -52,11 +62,35 @@ func NewHybridBind(listenPort int, relayURL string, myPubKey string) (*HybridBin
 		ws.WriteMessage(websocket.BinaryMessage, keyBytes)
 		go b.readWS()
 	} else {
-		fmt.Printf("⚠️ Warning: Could not connect to Relay: %v. Running in UDP-only mode.\n", err)
+		fmt.Printf("Warning: Could not connect to Relay: %v. Running in UDP-only mode.\n", err)
 	}
 
 	go b.readUDP()
 	return b, nil
+}
+
+func (b *HybridBind) RunControlLoop() {
+
+	for pkt := range b.ControlChan {
+
+		if VerifyStun(pkt.Data) {
+			select {
+			case b.StunRxChan <- pkt:
+
+			default:
+			}
+			continue
+		}
+
+		peerKey, valid := VerifyProbe(pkt.Data)
+		if valid {
+			if b.UpdatePeerEndpoint != nil {
+				b.UpdatePeerEndpoint(peerKey, pkt.Endpoint.(*UDPEndpoint).Addr)
+			}
+		}
+
+	}
+
 }
 
 func (b *HybridBind) readUDP() {
@@ -68,7 +102,15 @@ func (b *HybridBind) readUDP() {
 		}
 		pkt := make([]byte, n)
 		copy(pkt, buf[:n])
-		b.rxChan <- Packet{Data: pkt, Endpoint: &UDPEndpoint{Addr: addr}}
+
+		if VerifyWgpkt(pkt) {
+			b.rxChan <- Packet{Data: pkt, Endpoint: &UDPEndpoint{Addr: addr}}
+		} else {
+			select {
+			case b.ControlChan <- Packet{Data: pkt, Endpoint: &UDPEndpoint{Addr: addr}}:
+			default:
+			}
+		}
 	}
 }
 
@@ -167,3 +209,50 @@ func (e *RelayEndpoint) SrcIP() netip.Addr   { return netip.Addr{} }
 func (e *RelayEndpoint) SrcToString() string { return "relay" }
 func (e *RelayEndpoint) ClearSrc()           {}
 func (e *RelayEndpoint) DstToBytes() []byte  { return e.Key[:] } // Added: Required by interface
+
+func (b *HybridBind) SendRaw(data []byte, addr *net.UDPAddr) error {
+
+	_, err := b.udpConn.WriteToUDP(data, addr)
+	return err
+
+}
+
+func VerifyWgpkt(pkt []byte) bool {
+
+	if len(pkt) < 1 {
+		return false
+	}
+
+	return pkt[0] >= 1 && pkt[0] <= 4
+}
+
+func VerifyStun(pkt []byte) bool {
+
+	if len(pkt) < 8 {
+		return false
+	}
+
+	magicBytes := pkt[4:8]
+
+	magic := binary.BigEndian.Uint32(magicBytes)
+	// not able to do this then throw error
+
+	return magic == Stunbyte
+}
+
+func VerifyProbe(pkt []byte) (string, bool) {
+
+	if len(pkt) < 36 {
+		return "", false
+	}
+
+	magic := binary.BigEndian.Uint32(pkt[:4])
+	if magic != MagicProbeSig {
+		return "", false
+	}
+
+	peerKeybytes := pkt[4:36]
+	peerKeyHex := hex.EncodeToString(peerKeybytes)
+
+	return peerKeyHex, true
+}

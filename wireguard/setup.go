@@ -6,17 +6,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
-	"scale/internal/vpn" // This requires your go.mod module name to be "scale"
+	"scale/internal/vpn"
 
 	"github.com/joho/godotenv"
+	"github.com/pion/stun/v2"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/ipc"
 	"golang.zx2c4.com/wireguard/tun"
@@ -31,7 +34,7 @@ const (
 
 var WgDevice *device.Device
 
-// --- Data Structures ---
+var endpointCache sync.Map
 
 type Endpoint struct {
 	IP       string `json:"ip"`
@@ -69,6 +72,24 @@ func main() {
 	authToken := strings.TrimSpace(os.Getenv("AUTH_TOKEN"))
 	relayURL := strings.TrimSpace(os.Getenv("RELAY_URL"))
 
+	if authToken == "" {
+		log.Printf("error empty auth token")
+		email := os.Getenv("SCALE_EMAIL")
+		password := os.Getenv("SCALE_PASSWORD")
+
+		if email == "" || password == "" {
+			log.Fatal("Missing credentials: Set AUTH_TOKEN or (SCALE_EMAIL + SCALE_PASSWORD)")
+		}
+
+		// We need the helper function 'loginToServer' defined at the bottom of the file
+		var err error
+		authToken, err = loginToServer(serverURL, email, password)
+		if err != nil {
+			log.Fatalf("Auto-login failed: %v", err)
+		}
+		log.Println("Auto-login successful! Token acquired.")
+	}
+
 	if serverURL == "" || authToken == "" || relayURL == "" {
 		log.Fatal("WG_CONTROL_SERVER, AUTH_TOKEN, and RELAY_URL must be set.")
 	}
@@ -97,6 +118,25 @@ func main() {
 		log.Fatalf("Failed to create HybridBind: %v", err)
 	}
 
+	bind.UpdatePeerEndpoint = func(peerKey string, newAddr *net.UDPAddr) {
+		if last, loaded := endpointCache.Load(peerKey); loaded {
+			if last.(string) == newAddr.String() {
+				return
+			}
+		}
+
+		endpointCache.Store(peerKey, newAddr.String())
+
+		go func() {
+			cfg := fmt.Sprintf("public_key=%s\nendpoint=%s\n", peerKey, newAddr.String())
+			if err := WgDevice.IpcSet(cfg); err != nil {
+				endpointCache.Delete(peerKey)
+			} else {
+				log.Printf("Smart Trust: Peer %s moved to %s", peerKey[:8], newAddr.String())
+			}
+		}()
+	}
+
 	logger := device.NewLogger(device.LogLevelVerbose, "[wg0] ")
 	WgDevice = device.NewDevice(tunDev, bind, logger)
 	WgDevice.Up()
@@ -109,7 +149,6 @@ listen_port=%d
 		log.Fatalf("Failed to configure device: %v", err)
 	}
 
-	// Set IP on the interface
 	assignIPToInterface("wg0", regConfig.AssignedIP)
 
 	uapi, err := ipc.UAPIListen("wg0", nil)
@@ -125,26 +164,40 @@ listen_port=%d
 		}()
 	}
 
-	log.Println("✅ Client running. Starting polling loop...")
+	log.Println("Client running. Starting polling loop...")
 
-	go runServerPollingLoop(serverURL, pubKey.String(), authToken)
+	go bind.RunControlLoop()
+
+	go runServerPollingLoop(bind, serverURL, pubKey.String(), authToken)
 
 	waitForShutdown()
 }
 
-func runServerPollingLoop(serverURL, publicKey, authToken string) {
+func runServerPollingLoop(bind *vpn.HybridBind, serverURL, publicKey, authToken string) {
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 	httpClient := &http.Client{Timeout: 10 * time.Second}
 
-	performPollCycle(httpClient, serverURL, publicKey, authToken)
+	performPollCycle(bind, httpClient, serverURL, publicKey, authToken)
 
 	for range ticker.C {
-		performPollCycle(httpClient, serverURL, publicKey, authToken)
+		performPollCycle(bind, httpClient, serverURL, publicKey, authToken)
 	}
 }
 
-func performPollCycle(client *http.Client, serverURL, publicKey, authToken string) {
+func performPollCycle(bind *vpn.HybridBind, client *http.Client, serverURL, publicKey, authToken string) {
+
+	mypublicEp, err := performSTUN(nil, "")
+	if err != nil {
+		log.Printf("stun failed : %v", err)
+	} else {
+		log.Printf("public ip is: %s: %d", mypublicEp.IP, mypublicEp.Port)
+
+		if err := updateHeartbeat(client, serverURL, publicKey, authToken, mypublicEp); err != nil {
+			log.Printf("failed to send hearbeat : %v", err)
+		}
+	}
+
 	pollResp, err := pollServer(client, serverURL, authToken, publicKey)
 	if err != nil {
 		log.Printf("Error polling server: %v", err)
@@ -166,16 +219,16 @@ func performPollCycle(client *http.Client, serverURL, publicKey, authToken strin
 		endpointSet := false
 		for _, ep := range peer.Endpoints {
 			if ep.Protocol == "udp" {
-				ipcBuilder.WriteString(fmt.Sprintf("endpoint=%s:%d\n", ep.IP, ep.Port))
+				epString := fmt.Sprintf("%s:%d", ep.IP, ep.Port)
+				ipcBuilder.WriteString(fmt.Sprintf("endpoint=%s\n", epString))
+				endpointCache.Store(peer.PublicKey, epString)
 				endpointSet = true
 				break
 			}
 		}
 
 		if !endpointSet {
-			// FALLBACK: Use Relay.
-			// The Endpoint string will be the Public Key (Hex).
-			// vpn/hybrid.go's ParseEndpoint will detect this is NOT an IP and route to WebSocket.
+
 			ipcBuilder.WriteString(fmt.Sprintf("endpoint=%s\n", hex.EncodeToString(peerKey[:])))
 		}
 	}
@@ -187,13 +240,9 @@ func performPollCycle(client *http.Client, serverURL, publicKey, authToken strin
 	}
 }
 
-// --- Helpers ---
-
 func assignIPToInterface(iface, cidr string) {
-	// EXECUTE 'ip' command to assign address
 	cmd := exec.Command("ip", "addr", "add", cidr+"/24", "dev", iface)
 	if err := cmd.Run(); err != nil {
-		// It might fail if IP is already assigned, which is fine in some cases
 		log.Printf("Note: IP assignment to %s returned: %v", iface, err)
 	}
 
@@ -270,4 +319,119 @@ func waitForShutdown() {
 	if WgDevice != nil {
 		WgDevice.Close()
 	}
+}
+
+// wireguard/setup.go
+
+func performSTUN(bind *vpn.HybridBind, stunServer string) (*Endpoint, error) {
+	serverAddr, err := net.ResolveUDPAddr("udp", stunServer)
+	if err != nil {
+		return nil, err
+	}
+
+	// 1. Build STUN Request using pion/stun
+	msg := stun.MustBuild(stun.BindingRequest, stun.TransactionID)
+
+	// 2. Send using the SAME socket as WireGuard
+	if err := bind.SendRaw(msg.Raw, serverAddr); err != nil {
+		return nil, err
+	}
+
+	// 3. Wait for response on ControlChan
+	timeout := time.After(2 * time.Second)
+	for {
+		select {
+		case pkt := <-bind.StunRxChan:
+			// Is this a STUN packet? (Check magic cookie 0x2112A442)
+			if vpn.VerifyStun(pkt.Data) {
+				// Parse it
+				resp := new(stun.Message)
+				resp.Raw = pkt.Data
+				if err := resp.Decode(); err == nil {
+					var xorAddr stun.XORMappedAddress
+					if err := xorAddr.GetFrom(resp); err == nil {
+						return &Endpoint{
+							IP:       xorAddr.IP.String(),
+							Port:     xorAddr.Port,
+							Protocol: "udp",
+							Type:     "srflx",
+						}, nil
+					}
+				}
+			}
+		case <-timeout:
+			return nil, fmt.Errorf("STUN timeout")
+		}
+	}
+}
+
+func updateHeartbeat(client *http.Client, serverUrl, publicKey, authToken string, srflx *Endpoint) error {
+
+	type heartBeatPayload struct {
+		SrflxEndpoint *Endpoint `json:"srflx_endpoint,omitempty"`
+	}
+
+	payload := heartBeatPayload{
+		SrflxEndpoint: srflx,
+	}
+
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest("POST", serverUrl+"/api/devices/heartbeat", bytes.NewReader(payloadBytes))
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+authToken)
+	req.Header.Set("X-Device-Public-Key", publicKey)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("heartbeat failed with error : %s", resp.Status)
+	}
+
+	return nil
+}
+
+func loginToServer(serverUrl, email, password string) (string, error) {
+	payload, err := json.Marshal(map[string]string{
+		"email":    email,
+		"password": password,
+	})
+
+	if err != nil {
+		return "", err
+	}
+
+	resp, err := http.Post(serverUrl+"/api/login", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		return "", err
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("login failed with status %s", resp.Status)
+	}
+
+	var result map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+
+	token, ok := result["token"]
+	if !ok {
+		return "", fmt.Errorf("response does not contain token")
+	}
+	return token, nil
 }
