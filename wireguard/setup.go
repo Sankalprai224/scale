@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -35,6 +36,8 @@ const (
 var WgDevice *device.Device
 
 var endpointCache sync.Map
+
+var activeSprayers sync.Map
 
 type Endpoint struct {
 	IP       string `json:"ip"`
@@ -187,7 +190,7 @@ func runServerPollingLoop(bind *vpn.HybridBind, serverURL, publicKey, authToken 
 
 func performPollCycle(bind *vpn.HybridBind, client *http.Client, serverURL, publicKey, authToken string) {
 
-	mypublicEp, err := performSTUN(nil, "")
+	mypublicEp, err := performSTUN(bind, "stun.l.google.com:19302")
 	if err != nil {
 		log.Printf("stun failed : %v", err)
 	} else {
@@ -216,7 +219,10 @@ func performPollCycle(bind *vpn.HybridBind, client *http.Client, serverURL, publ
 		ipcBuilder.WriteString(fmt.Sprintf("allowed_ips=%s/32\n", peer.ID))
 		ipcBuilder.WriteString(fmt.Sprintf("persistent_keepalive_interval=%d\n", keepAliveInterval))
 
+		StartHolePunching(bind, peer.PublicKey, peer.Endpoints, publicKey)
+
 		endpointSet := false
+
 		for _, ep := range peer.Endpoints {
 			if ep.Protocol == "udp" {
 				epString := fmt.Sprintf("%s:%d", ep.IP, ep.Port)
@@ -225,7 +231,10 @@ func performPollCycle(bind *vpn.HybridBind, client *http.Client, serverURL, publ
 				endpointSet = true
 				break
 			}
+
 		}
+
+		StartHolePunching(bind, peer.PublicKey, peer.Endpoints, publicKey)
 
 		if !endpointSet {
 
@@ -434,4 +443,68 @@ func loginToServer(serverUrl, email, password string) (string, error) {
 		return "", fmt.Errorf("response does not contain token")
 	}
 	return token, nil
+}
+
+// StartHolePunching sends Magic Probes to all candidate addresses of a peer.
+// myLocalPubKey: The public key of THIS device (so the peer knows who is knocking).
+func StartHolePunching(bind *vpn.HybridBind, peerKey string, endpoints []Endpoint, myLocalPubKey string) {
+
+	// 1. DEDUP CHECK
+	// If we are already spraying this peer, don't start another gun.
+	if _, loaded := activeSprayers.LoadOrStore(peerKey, true); loaded {
+		return
+	}
+
+	// 2. PARSE CANDIDATES
+	var candidates []*net.UDPAddr
+	for _, ep := range endpoints {
+		// Only target UDP endpoints
+		if ep.Protocol == "udp" {
+			// Resolve string "1.2.3.4:51820" -> UDP Address
+			addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", ep.IP, ep.Port))
+			if err == nil {
+				candidates = append(candidates, addr)
+			}
+		}
+	}
+
+	if len(candidates) == 0 {
+		activeSprayers.Delete(peerKey) // Cleanup if nothing to do
+		return
+	}
+
+	// 3. LAUNCH ARTILLERY (Async)
+	go func() {
+		// Ensure we unlock this peer when done
+		defer activeSprayers.Delete(peerKey)
+
+		// A. Construct the Magic Packet
+		// [4 bytes Magic] + [32 bytes My Pub Key]
+		pkt := make([]byte, 36)
+		binary.BigEndian.PutUint32(pkt[:4], vpn.MagicProbeSig)
+
+		// Decode our local key from Hex String to Bytes
+		myKeyBytes, err := hex.DecodeString(myLocalPubKey)
+		if err != nil || len(myKeyBytes) != 32 {
+			log.Printf("Error decoding local key for hole punching: %v", err)
+			return
+		}
+		copy(pkt[4:], myKeyBytes)
+
+		log.Printf("Spraying %d candidates for peer %s...", len(candidates), peerKey[:8])
+
+		// B. Fire 5 Rounds
+		for i := 0; i < 5; i++ {
+			for _, addr := range candidates {
+				// Send directly through the WireGuard socket
+				if err := bind.SendRaw(pkt, addr); err != nil {
+					// Ignore errors (fire and forget)
+				}
+			}
+			// Wait 300ms between bursts
+			time.Sleep(150 * time.Millisecond)
+		}
+
+		// log.Printf(" Finished spraying %s", peerKey[:8])
+	}()
 }
