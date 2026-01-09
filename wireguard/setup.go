@@ -195,10 +195,14 @@ func performPollCycle(bind *vpn.HybridBind, client *http.Client, serverURL, publ
 		log.Printf("stun failed : %v", err)
 	} else {
 		log.Printf("public ip is: %s: %d", mypublicEp.IP, mypublicEp.Port)
+	}
 
-		if err := updateHeartbeat(client, serverURL, publicKey, authToken, mypublicEp); err != nil {
-			log.Printf("failed to send hearbeat : %v", err)
-		}
+	localEps, err := getLocalIPs()
+	if err != nil {
+		log.Printf("failed to get local ips: %v", err)
+	}
+	if err := updateHeartbeat(client, serverURL, publicKey, authToken, mypublicEp, localEps); err != nil {
+		log.Printf("failed to send hearbeat : %v", err)
 	}
 
 	pollResp, err := pollServer(client, serverURL, authToken, publicKey)
@@ -218,8 +222,6 @@ func performPollCycle(bind *vpn.HybridBind, client *http.Client, serverURL, publ
 		ipcBuilder.WriteString(fmt.Sprintf("public_key=%s\n", hex.EncodeToString(peerKey[:])))
 		ipcBuilder.WriteString(fmt.Sprintf("allowed_ips=%s/32\n", peer.ID))
 		ipcBuilder.WriteString(fmt.Sprintf("persistent_keepalive_interval=%d\n", keepAliveInterval))
-
-		StartHolePunching(bind, peer.PublicKey, peer.Endpoints, publicKey)
 
 		endpointSet := false
 
@@ -374,10 +376,11 @@ func performSTUN(bind *vpn.HybridBind, stunServer string) (*Endpoint, error) {
 	}
 }
 
-func updateHeartbeat(client *http.Client, serverUrl, publicKey, authToken string, srflx *Endpoint) error {
+func updateHeartbeat(client *http.Client, serverUrl, publicKey, authToken string, srflx *Endpoint, hostEps []Endpoint) error {
 
 	type heartBeatPayload struct {
-		SrflxEndpoint *Endpoint `json:"srflx_endpoint,omitempty"`
+		SrflxEndpoint *Endpoint  `json:"srflx_endpoint,omitempty"`
+		HostEndpoints []Endpoint `json:"host_endpoints"`
 	}
 
 	payload := heartBeatPayload{
@@ -507,4 +510,32 @@ func StartHolePunching(bind *vpn.HybridBind, peerKey string, endpoints []Endpoin
 
 		// log.Printf(" Finished spraying %s", peerKey[:8])
 	}()
+}
+
+func getLocalIPs() ([]Endpoint, error) {
+	var endpoints []Endpoint
+	ifaces, _ := net.Interfaces()
+	for _, i := range ifaces {
+		addrs, _ := i.Addrs()
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			// Skip loopback (127.0.0.1) and non-IPv4 (optional)
+			if ip == nil || ip.IsLoopback() || ip.To4() == nil {
+				continue
+			}
+			endpoints = append(endpoints, Endpoint{
+				IP:       ip.String(),
+				Port:     listenPort, // 51820
+				Protocol: "udp",
+				Type:     "host",
+			})
+		}
+	}
+	return endpoints, nil
 }
