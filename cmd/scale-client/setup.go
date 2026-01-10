@@ -553,9 +553,8 @@ func getLocalIPs() ([]Endpoint, error) {
 			case *net.IPAddr:
 				ip = v.IP
 			}
-			// Skip loopback (127.0.0.1) and non-IPv4 (optional)
-			//if ip == nil || ip.IsLoopback() || ip.To4() == nil {
-			if ip == nil || ip.To4() == nil {
+			if ip == nil || ip.IsLoopback() || ip.To4() == nil {
+				//if ip == nil || ip.To4() == nil {
 				continue
 			}
 			endpoints = append(endpoints, Endpoint{
