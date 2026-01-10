@@ -107,7 +107,7 @@ func Login(c *fiber.Ctx) error {
 	}
 	c.Cookie(&cookie)
 
-	return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{
 		"message": "Login successful",
 		"token":   token, // <--- Add this!
 	})
