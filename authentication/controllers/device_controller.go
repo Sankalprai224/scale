@@ -31,9 +31,9 @@ type HeartbeatRequest struct {
 }
 
 type PeerConfig struct {
-	PublicKey  string   `json:"public_key"`
-	AllowedIPs []string `json:"allowed_ips"`
-	Endpoint   string   `json:"endpoint,omitempty"`
+	PublicKey  string           `json:"public_key"`
+	AllowedIPs []string         `json:"allowed_ips"`
+	Endpoints  []types.Endpoint `json:"endpoints,omitempty"`
 }
 
 func InitIPAllocator() {
@@ -64,7 +64,7 @@ func RegisterDevice(c *fiber.Ctx) error {
 	if err != nil {
 		if err == gorm.ErrRecordNotFound {
 			log.Printf("Registering new device with public key: %s", req.PublicKey)
-			ip, err := ipAllocator.AllocateCIDR(32)
+			ip, err := ipAllocator.AllocateCIDR(24)
 			if err != nil {
 				return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "IP allocation failed"})
 			}
@@ -167,22 +167,45 @@ func GetPeerConfig(c *fiber.Ctx) error {
 	// We still check for live endpoints for each peer from the cached list.
 	peerConfigs := make([]PeerConfig, 0, len(peers))
 	for _, peer := range peers {
-		redisKey := fmt.Sprintf("device:endpoint:%s", peer.PublicKey)
-		endpoint, err := database.Rdb.Get(database.Ctx, redisKey).Result()
+		redisKey := fmt.Sprintf("device:endpoints:%s", peer.PublicKey)
+		//endpoint, err := database.Rdb.Get(database.Ctx, redisKey).Result()
+		//if err == redis.Nil {
+		//	continue // Peer is offline
+		//} else if err != nil {
+		//	log.Printf("Could not get endpoint for peer %s from Redis: %v", peer.PublicKey, err)
+		//continue
+		//}
+		//	peerConfigs = append(peerConfigs, PeerConfig{
+		//		PublicKey:  peer.PublicKey,
+		//		AllowedIPs: []string{peer.AssignedIP},
+		//		Endpoint:   endpoint,
+		//	})
+
+		endpointsJSON, err := database.Rdb.Get(database.Ctx, redisKey).Result()
 		if err == redis.Nil {
 			continue // Peer is offline
 		} else if err != nil {
-			log.Printf("Could not get endpoint for peer %s from Redis: %v", peer.PublicKey, err)
+			log.Printf("Could not get endpoints for peer %s: %v", peer.PublicKey, err)
 			continue
 		}
+
+		var endpoints []types.Endpoint
+		if err := json.Unmarshal([]byte(endpointsJSON), &endpoints); err != nil {
+			log.Printf("Failed to unmarshal endpoints for peer %s: %v", peer.PublicKey, err)
+			continue
+		}
+
 		peerConfigs = append(peerConfigs, PeerConfig{
 			PublicKey:  peer.PublicKey,
 			AllowedIPs: []string{peer.AssignedIP},
-			Endpoint:   endpoint,
+			Endpoints:  endpoints,
 		})
+
 	}
 
+	//return c.JSON(fiber.Map{
+	//	"peer_configs": peerConfigs,
 	return c.JSON(fiber.Map{
-		"peer_configs": peerConfigs,
+		"peers": peerConfigs,
 	})
 }

@@ -47,9 +47,10 @@ type Endpoint struct {
 }
 
 type PeerInfo struct {
-	ID        string     `json:"id"`
-	PublicKey string     `json:"public_key"`
-	Endpoints []Endpoint `json:"endpoints,omitempty"`
+	ID         string     `json:"id"`
+	PublicKey  string     `json:"public_key"`
+	Endpoints  []Endpoint `json:"endpoints,omitempty"`
+	AllowedIPs []string   `json:"allowed_ips"`
 }
 
 type PeerConfig struct {
@@ -217,21 +218,24 @@ func runServerPollingLoop(bind *vpn.HybridBind, serverURL, publicKey, authToken 
 
 func performPollCycle(bind *vpn.HybridBind, client *http.Client, serverURL, publicKey, authToken string) {
 
+	// 1. STUN Check (Get Public IP)
 	mypublicEp, err := performSTUN(bind, "stun.l.google.com:19302")
 	if err != nil {
 		log.Printf("stun failed : %v", err)
-	} else {
-		log.Printf("public ip is: %s: %d", mypublicEp.IP, mypublicEp.Port)
 	}
 
+	// 2. Get Local IPs (LAN/Loopback)
 	localEps, err := getLocalIPs()
 	if err != nil {
 		log.Printf("failed to get local ips: %v", err)
 	}
+
+	// 3. Send Heartbeat to Server
 	if err := updateHeartbeat(client, serverURL, publicKey, authToken, mypublicEp, localEps); err != nil {
-		log.Printf("failed to send hearbeat : %v", err)
+		log.Printf("failed to send heartbeat : %v", err)
 	}
 
+	// 4. Poll for Peers
 	pollResp, err := pollServer(client, serverURL, authToken, publicKey)
 	if err != nil {
 		log.Printf("Error polling server: %v", err)
@@ -240,40 +244,79 @@ func performPollCycle(bind *vpn.HybridBind, client *http.Client, serverURL, publ
 
 	var ipcBuilder strings.Builder
 
+	// 5. Iterate over Peers
 	for _, peer := range pollResp.Peers {
-		peerKey, err := wgtypes.ParseKey(peer.PublicKey)
-		if err != nil {
+		// Skip ourselves
+		if peer.PublicKey == publicKey {
 			continue
 		}
 
-		ipcBuilder.WriteString(fmt.Sprintf("public_key=%s\n", hex.EncodeToString(peerKey[:])))
-		ipcBuilder.WriteString(fmt.Sprintf("allowed_ips=%s/32\n", peer.ID))
-		ipcBuilder.WriteString(fmt.Sprintf("persistent_keepalive_interval=%d\n", keepAliveInterval))
+		// --- SMART ENDPOINT SELECTION LOGIC ---
+		var bestEndpoint Endpoint
+		found := false
 
-		endpointSet := false
-
+		// Priority 1: Look for Localhost (127.0.0.1) - Critical for your current testing!
 		for _, ep := range peer.Endpoints {
-			if ep.Protocol == "udp" {
-				epString := fmt.Sprintf("%s:%d", ep.IP, ep.Port)
-				ipcBuilder.WriteString(fmt.Sprintf("endpoint=%s\n", epString))
-				endpointCache.Store(peer.PublicKey, epString)
-				endpointSet = true
+			if strings.HasPrefix(ep.IP, "127.") {
+				bestEndpoint = ep
+				found = true
 				break
 			}
-
 		}
 
+		// Priority 2: Look for LAN IPs (192.168.x.x, 10.x.x.x) if no localhost
+		if !found {
+			for _, ep := range peer.Endpoints {
+				if strings.HasPrefix(ep.IP, "192.168.") || strings.HasPrefix(ep.IP, "10.") {
+					bestEndpoint = ep
+					found = true
+					break
+				}
+			}
+		}
+
+		// Priority 3: Fallback to whatever is first (Usually Public IP)
+		if !found && len(peer.Endpoints) > 0 {
+			bestEndpoint = peer.Endpoints[0]
+			found = true
+		}
+
+		// --- BUILD WIREGUARD CONFIG ---
+		// Write Public Key & Allowed IPs
+		ipcBuilder.WriteString(fmt.Sprintf("public_key=%s\n", peer.PublicKey))
+
+		// Allowed IPs are the VPN IPs (e.g., 100.64.0.x/32)
+		if len(peer.AllowedIPs) > 0 {
+			ipcBuilder.WriteString(fmt.Sprintf("allowed_ips=%s\n", strings.Join(peer.AllowedIPs, ",")))
+		} else {
+			// Fallback if server sent empty allowed_ips (shouldn't happen, but good safety)
+			// ipcBuilder.WriteString(fmt.Sprintf("allowed_ips=%s/32\n", peer.ID))
+		}
+
+		// Set Persistent Keepalive
+		ipcBuilder.WriteString(fmt.Sprintf("persistent_keepalive_interval=%d\n", keepAliveInterval))
+
+		// Set the Endpoint (The IP:Port we connect to)
+		if found {
+			epString := fmt.Sprintf("%s:%d", bestEndpoint.IP, bestEndpoint.Port)
+			ipcBuilder.WriteString(fmt.Sprintf("endpoint=%s\n", epString))
+
+			// Log it so you can SEE it working
+			log.Printf("🔗 Linking peer %s via %s", peer.PublicKey[:8], epString)
+
+			// Cache it (optional, but good for your hole punching logic)
+			endpointCache.Store(peer.PublicKey, epString)
+		}
+
+		// --- HOLE PUNCHING ---
+		// Fire UDP packets at *all* candidates just in case the "Smart" choice was wrong
 		StartHolePunching(bind, peer.PublicKey, peer.Endpoints, publicKey)
-
-		if !endpointSet {
-
-			ipcBuilder.WriteString(fmt.Sprintf("endpoint=%s\n", hex.EncodeToString(peerKey[:])))
-		}
 	}
 
+	// 6. Apply Configuration to WireGuard Device
 	if ipcBuilder.Len() > 0 {
 		if err := WgDevice.IpcSet(ipcBuilder.String()); err != nil {
-			log.Printf("Failed to update peers: %v", err)
+			log.Printf("Failed to configure peers: %v", err)
 		}
 	}
 }
@@ -553,8 +596,8 @@ func getLocalIPs() ([]Endpoint, error) {
 			case *net.IPAddr:
 				ip = v.IP
 			}
-			if ip == nil || ip.IsLoopback() || ip.To4() == nil {
-				//if ip == nil || ip.To4() == nil {
+			//if ip == nil || ip.IsLoopback() || ip.To4() == nil {
+			if ip == nil || ip.To4() == nil {
 				continue
 			}
 			endpoints = append(endpoints, Endpoint{
