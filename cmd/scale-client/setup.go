@@ -178,7 +178,7 @@ listen_port=%d
 		log.Fatalf("Failed to configure device: %v", err)
 	}
 
-	assignIPToInterface(wgIface, regConfig.AssignedIP)
+	//assignIPToInterface(wgIface, regConfig.AssignedIP)
 
 	uapi, err := ipc.UAPIListen(wgIface, nil)
 	if err != nil {
