@@ -41,18 +41,22 @@ func (s *StunController) Poll(c *fiber.Ctx) error {
 		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to generate token"})
 	}
 
-	// Fetch all devices from the cache to build the peer list
+	// Fetch all devices: try Redis cache first, fall back to PostgreSQL
+	var allDevices []models.Device
 	cachedDevicesJSON, err := database.Rdb.Get(database.Ctx, "cache:all_devices").Result()
 	if err != nil {
-		log.Printf("Device cache is not available: %v", err)
-		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to retrieve peer list from cache"})
-	}
-
-	var allDevices []models.Device
-	// Use json.Unmarshal to parse the string from Redis, not c.BodyParser
-	if err := json.Unmarshal([]byte(cachedDevicesJSON), &allDevices); err != nil {
-		log.Printf("Failed to unmarshal cached devices: %v", err)
-		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to parse peer list"})
+		// Redis unavailable — fall back to PostgreSQL (source of truth)
+		log.Printf("Cache miss, falling back to PostgreSQL: %v", err)
+		allDevices, err = database.GetAllDevices()
+		if err != nil {
+			log.Printf("PostgreSQL fallback also failed: %v", err)
+			return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to retrieve peer list"})
+		}
+	} else {
+		if err := json.Unmarshal([]byte(cachedDevicesJSON), &allDevices); err != nil {
+			log.Printf("Failed to unmarshal cached devices: %v", err)
+			return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to parse peer list"})
+		}
 	}
 
 	clientPubKey := c.Get("X-Device-Public-Key")

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -24,10 +25,11 @@ var upgrader = websocket.Upgrader{
 }
 
 type client struct {
-	conn *websocket.Conn
-	send chan []byte
-	key  string
-	quit chan struct{}
+	conn      *websocket.Conn
+	send      chan []byte
+	key       string
+	closeOnce sync.Once
+	quit      chan struct{}
 }
 
 var (
@@ -39,16 +41,13 @@ func (c *client) writePump() {
 	ticker := time.NewTicker(pingWait)
 	defer func() {
 		ticker.Stop()
-		c.conn.Close()
+		c.Cleanup()
 	}()
 
 	for {
 		select {
-		case message, ok := <-c.send:
-			if !ok {
-				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
-				return
-			}
+		case message := <-c.send:
+
 			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 
 			err := c.conn.WriteMessage(websocket.BinaryMessage, message)
@@ -61,18 +60,16 @@ func (c *client) writePump() {
 			if err != nil {
 				return
 			}
+		case <-c.quit:
+			c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+			return
 		}
 
 	}
 }
 
 func (c *client) readPump() {
-	defer func() {
-		mutex.Lock()
-		delete(clients, c.key)
-		mutex.Unlock()
-		close(c.send)
-	}()
+	defer c.Cleanup()
 
 	c.conn.SetReadDeadline(time.Now().Add(pongWait))
 
@@ -117,6 +114,8 @@ func (c *client) readPump() {
 
 			select {
 			case destClient.send <- forwardMessage:
+			case <-destClient.quit:
+				log.Printf("dropped packet to %.8s (peer closing)", destKey)
 			default:
 				log.Printf("dropped the packet to %.8s (send buffer full)", destKey)
 			}
@@ -125,25 +124,55 @@ func (c *client) readPump() {
 
 }
 
-func wsHandler(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		fmt.Println("error upgrading:", err)
-		return
+func wsHandler(authKey string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		requestKey := r.URL.Query().Get("auth")
+		if requestKey != authKey {
+			log.Printf("auth key mismatch : unauthorized")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			fmt.Println("error upgrading:", err)
+			return
+		}
+
+		c := &client{
+			conn: conn,
+			send: make(chan []byte, 256),
+			quit: make(chan struct{}),
+		}
+
+		go c.writePump()
+		go c.readPump()
+
 	}
+}
 
-	c := &client{
-		conn: conn,
-		send: make(chan []byte, 256),
-	}
-
-	go c.writePump()
-	go c.readPump()
-
+func (c *client) Cleanup() {
+	c.closeOnce.Do(func() {
+		if c.key != "" {
+			mutex.Lock()
+			if clients[c.key] == c {
+				delete(clients, c.key)
+			}
+			mutex.Unlock()
+		}
+		c.conn.Close()
+		close(c.quit)
+	})
 }
 
 func main() {
-	http.HandleFunc("/derp", wsHandler)
+
+	clientAuthKey := os.Getenv("DERP_AUTH_KEY")
+	if clientAuthKey == "" {
+		log.Fatal("derp auth key is not set up in the environment")
+	}
+
+	http.HandleFunc("/derp", wsHandler(clientAuthKey))
 	fmt.Println("derp server running on wss://localhost:8443/derp")
 	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", nil))
 }

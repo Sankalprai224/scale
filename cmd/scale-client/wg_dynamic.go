@@ -10,9 +10,7 @@ import (
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
-// syncWireGuardPeers updates the internal Engine with the latest peer list
 func syncWireGuardPeers(interfaceName string, serverPeers []PeerConfig, replacePeers bool) error {
-	// We build a large IPC configuration string
 	var sb strings.Builder
 
 	if replacePeers {

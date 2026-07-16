@@ -113,29 +113,18 @@ func Login(c *fiber.Ctx) error {
 	})
 }
 
-// User retrieves user info based on JWT in cookie
+// User retrieves user info based on the authenticated user from middleware
 func User(c *fiber.Ctx) error {
 	fmt.Println("Request to get user info")
 
-	var secretKey = os.Getenv("JWT_SECRET")
-
-	cookie := c.Cookies("jwt")
-
-	token, err := jwt.ParseWithClaims(cookie, jwt.MapClaims{}, func(token *jwt.Token) (interface{}, error) {
-		return []byte(secretKey), nil
-	})
-	if err != nil || !token.Valid {
+	userIDStr, ok := c.Locals("x-user-id").(string)
+	if !ok {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "Unauthorized"})
 	}
 
-	claims, ok := token.Claims.(jwt.MapClaims)
-	if !ok {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to parse claims"})
-	}
-
-	id, err := strconv.Atoi(fmt.Sprintf("%v", claims["sub"]))
+	id, err := strconv.Atoi(userIDStr)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Invalid token subject"})
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Invalid user ID"})
 	}
 
 	// Fetch user from DB

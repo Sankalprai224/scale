@@ -2,23 +2,21 @@ package util
 
 import (
 	"fmt"
-	models "scale/models" // 1. Import the central models package
+	models "scale/models"
 	"strconv"
 	"time"
 
 	jwt "github.com/golang-jwt/jwt/v4"
 )
 
-// CreateAccessToken now correctly accepts a *models.User
 func CreateAccessToken(user *models.User, secret string, expiry int) (accessToken string, err error) {
 	expTime := time.Now().Add(time.Hour * time.Duration(expiry))
 
-	// Convert the uint ID to a string for the JWT claim
 	userIDStr := strconv.FormatUint(uint64(user.ID), 10)
 
 	claims := &JwtCustomClaims{
 		Name: user.Name,
-		ID:   userIDStr, // Use the converted string ID
+		ID:   userIDStr,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(expTime),
 		},
@@ -32,15 +30,13 @@ func CreateAccessToken(user *models.User, secret string, expiry int) (accessToke
 	return t, nil
 }
 
-// CreateRefreshToken now correctly accepts a *models.User
 func CreateRefreshToken(user *models.User, secret string, expiry int) (refreshToken string, err error) {
 	expTime := time.Now().Add(time.Hour * time.Duration(expiry))
 
-	// Convert the uint ID to a string for the JWT claim
 	userIDStr := strconv.FormatUint(uint64(user.ID), 10)
 
 	claimsRefresh := &JwtCustomRefreshClaims{
-		ID: userIDStr, // Use the converted string ID
+		ID: userIDStr,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(expTime),
 		},
@@ -85,5 +81,9 @@ func ExtractIDFromToken(requestToken string, secret string) (string, error) {
 		return "", fmt.Errorf("invalid Token")
 	}
 
-	return claims["sub"].(string), nil
+	sub, ok := claims["sub"].(string)
+	if !ok {
+		return "", fmt.Errorf("invalid 'sub' claim: expected string")
+	}
+	return sub, nil
 }

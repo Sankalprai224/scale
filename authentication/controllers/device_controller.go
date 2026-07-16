@@ -38,7 +38,7 @@ type PeerConfig struct {
 
 func InitIPAllocator() {
 	var err error
-	ipAllocator, err = ipmanager.NewIPAllocator("100.64.0.0/24")
+	ipAllocator, err = ipmanager.NewIPAllocator("100.64.0.0/16")
 	if err != nil {
 		log.Fatalf("Failed to initialize IP allocator: %v", err)
 	}
@@ -64,7 +64,7 @@ func RegisterDevice(c *fiber.Ctx) error {
 	if err != nil {
 		if err == gorm.ErrRecordNotFound {
 			log.Printf("Registering new device with public key: %s", req.PublicKey)
-			ip, err := ipAllocator.AllocateCIDR(24)
+			ip, err := ipAllocator.AllocateCIDR(16)
 			if err != nil {
 				return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "IP allocation failed"})
 			}
@@ -97,13 +97,29 @@ func Heartbeat(c *fiber.Ctx) error {
 		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Invalid request body"})
 	}
 
-	// GET THE PUBLIC KEY FROM THE HEADER (client is already sending it)
 	clientPubKey := c.Get("X-Device-Public-Key")
 	if clientPubKey == "" {
 		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Missing X-Device-Public-Key header"})
 	}
 
-	redisKey := fmt.Sprintf("device:endpoints:%s", clientPubKey) // <-- Use a new key name
+	// Verify the device belongs to the authenticated user
+	userIDStr, ok := c.Locals("x-user-id").(string)
+	if !ok {
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Could not get user ID from token"})
+	}
+	userID, err := strconv.ParseUint(userIDStr, 10, 32)
+	if err != nil {
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Invalid user ID format"})
+	}
+	ownerDevice, err := database.FindDeviceByPublicKey(clientPubKey)
+	if err != nil {
+		return c.Status(http.StatusForbidden).JSON(fiber.Map{"error": "Device not registered"})
+	}
+	if ownerDevice.UserID != uint(userID) {
+		return c.Status(http.StatusForbidden).JSON(fiber.Map{"error": "Device does not belong to authenticated user"})
+	}
+
+	redisKey := fmt.Sprintf("device:endpoints:%s", clientPubKey)
 
 	// Combine all endpoints into one list
 	allEndpoints := req.HostEndpoints
@@ -140,20 +156,22 @@ func GetPeerConfig(c *fiber.Ctx) error {
 		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Device public key is required"})
 	}
 
-	// **CHANGE**: Step 1 - Fetch the device list from the Redis cache.
+	// **CHANGE**: Step 1 - Fetch the device list from the Redis cache or fallback to PostgreSQL.
+	var allDevices []models.Device
 	cachedDevicesJSON, err := database.Rdb.Get(database.Ctx, "cache:all_devices").Result()
 	if err != nil {
-		// If the cache is empty for some reason, return an error.
-		// This should be rare as the background worker keeps it populated.
-		log.Printf("Device cache is not available: %v", err)
-		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to retrieve peer list from cache"})
-	}
-
-	// **CHANGE**: Step 2 - Deserialize the JSON and filter out the current client.
-	var allDevices []models.Device
-	if err := json.Unmarshal([]byte(cachedDevicesJSON), &allDevices); err != nil {
-		log.Printf("Failed to unmarshal cached devices: %v", err)
-		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to parse peer list"})
+		log.Printf("Cache miss, falling back to PostgreSQL: %v", err)
+		allDevices, err = database.GetAllDevices()
+		if err != nil {
+			log.Printf("PostgreSQL fallback also failed: %v", err)
+			return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to retrieve peer list"})
+		}
+	} else {
+		// **CHANGE**: Step 2 - Deserialize the JSON and filter out the current client.
+		if err := json.Unmarshal([]byte(cachedDevicesJSON), &allDevices); err != nil {
+			log.Printf("Failed to unmarshal cached devices: %v", err)
+			return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to parse peer list"})
+		}
 	}
 
 	peers := make([]models.Device, 0, len(allDevices))
