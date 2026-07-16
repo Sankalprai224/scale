@@ -1,6 +1,7 @@
 package vpn
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
@@ -9,6 +10,8 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"golang.zx2c4.com/wireguard/conn"
@@ -19,12 +22,24 @@ const MagicProbeSig uint32 = 0xFF505242
 
 // HybridBind handles BOTH UDP (P2P) and WebSocket (Relay)
 type HybridBind struct {
-	udpConn     *net.UDPConn
-	wsConn      *websocket.Conn
-	wsLock      sync.Mutex
-	rxChan      chan Packet
-	ControlChan chan Packet
-	StunRxChan  chan Packet
+	udpConn      *net.UDPConn
+	wsConn       *websocket.Conn
+	wsLock       sync.Mutex
+	rxChan       chan Packet
+	ControlChan  chan Packet
+	StunRxChan   chan Packet
+	udpFailCount int
+	failLock     sync.Mutex
+	IpMap        map[string]*net.UDPAddr
+	mapLock      sync.Mutex
+	lastPongTime time.Time
+	pongLock     sync.Mutex
+	myPubKey     [32]byte
+	rxDropCount  int64
+
+	closeChan chan struct{}
+	isClosed  bool
+	mu        sync.Mutex
 
 	UpdatePeerEndpoint func(peerKeyHex string, newAddr *net.UDPAddr)
 }
@@ -39,6 +54,8 @@ func NewHybridBind(listenPort int, relayURL string, myPubKey string) (*HybridBin
 		rxChan:      make(chan Packet, 1024),
 		ControlChan: make(chan Packet, 1024),
 		StunRxChan:  make(chan Packet, 1024),
+		IpMap:       make(map[string]*net.UDPAddr),
+		closeChan:   make(chan struct{}),
 	}
 
 	// 1. Setup UDP
@@ -52,13 +69,23 @@ func NewHybridBind(listenPort int, relayURL string, myPubKey string) (*HybridBin
 	// 2. Setup WebSocket
 	//ws, _, err := websocket.DefaultDialer.Dial(relayURL, nil)
 
+	keyBytes, hexErr := hex.DecodeString(myPubKey)
+	if hexErr != nil {
+		b.udpConn.Close()
+		return nil, fmt.Errorf("invalid myPubKey hex: %w", hexErr)
+	}
+	if len(keyBytes) != 32 {
+		b.udpConn.Close()
+		return nil, fmt.Errorf("myPubKey must be exactly 32 bytes, got %d", len(keyBytes))
+	}
+	b.myPubKey = [32]byte(keyBytes)
+
+	// 2. Setup WebSocket
 	dialer := *websocket.DefaultDialer
 	dialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-
-	ws, _, err := dialer.Dial(relayURL, nil) // Use 'dialer', not 'DefaultDialer'
+	ws, _, err := dialer.Dial(relayURL, nil)
 	if err == nil {
 		b.wsConn = ws
-		keyBytes, _ := hex.DecodeString(myPubKey)
 		ws.WriteMessage(websocket.BinaryMessage, keyBytes)
 		go b.readWS()
 	} else {
@@ -81,12 +108,35 @@ func (b *HybridBind) RunControlLoop() {
 			}
 			continue
 		}
-
 		peerKey, valid := VerifyProbe(pkt.Data)
-		if valid {
-			if b.UpdatePeerEndpoint != nil {
-				b.UpdatePeerEndpoint(peerKey, pkt.Endpoint.(*UDPEndpoint).Addr)
-			}
+		if !valid {
+			continue
+		}
+
+		b.pongLock.Lock()
+		b.lastPongTime = time.Now()
+		b.pongLock.Unlock()
+
+		b.failLock.Lock()
+		b.udpFailCount = 0
+		b.failLock.Unlock()
+
+		newAddress := pkt.Endpoint.(*UDPEndpoint).Addr
+
+		addressChanged := false
+
+		b.mapLock.Lock()
+		oldAddress := b.IpMap[peerKey]
+
+		if oldAddress == nil || oldAddress.String() != newAddress.String() {
+			b.IpMap[peerKey] = newAddress
+			addressChanged = true
+		}
+		b.mapLock.Unlock()
+
+		if valid && b.UpdatePeerEndpoint != nil && addressChanged {
+			fmt.Printf("peer %s is roaming on new address: %s/n", peerKey, newAddress.String())
+			b.UpdatePeerEndpoint(peerKey, newAddress)
 		}
 
 	}
@@ -104,7 +154,11 @@ func (b *HybridBind) readUDP() {
 		copy(pkt, buf[:n])
 
 		if VerifyWgpkt(pkt) {
-			b.rxChan <- Packet{Data: pkt, Endpoint: &UDPEndpoint{Addr: addr}}
+			select {
+			case b.rxChan <- Packet{Data: pkt, Endpoint: &UDPEndpoint{Addr: addr}}:
+			default:
+				atomic.AddInt64(&b.rxDropCount, 1)
+			}
 		} else {
 			select {
 			case b.ControlChan <- Packet{Data: pkt, Endpoint: &UDPEndpoint{Addr: addr}}:
@@ -125,7 +179,11 @@ func (b *HybridBind) readWS() {
 			data := msg[32:]
 			var key [32]byte
 			copy(key[:], senderKey)
-			b.rxChan <- Packet{Data: data, Endpoint: &RelayEndpoint{Key: key}}
+			select {
+			case b.rxChan <- Packet{Data: data, Endpoint: &RelayEndpoint{Key: key}}:
+			default:
+				atomic.AddInt64(&b.rxDropCount, 1)
+			}
 		}
 	}
 }
@@ -151,12 +209,29 @@ func (b *HybridBind) ParseEndpoint(s string) (conn.Endpoint, error) {
 
 func (b *HybridBind) Send(packets [][]byte, ep conn.Endpoint) error {
 	if udpEp, ok := ep.(*UDPEndpoint); ok {
+		var errs []error
 		for _, pkt := range packets {
-			b.udpConn.WriteToUDP(pkt, udpEp.Addr)
+			n, err := b.udpConn.WriteToUDP(pkt, udpEp.Addr)
+			if err != nil {
+				fmt.Printf("udp packets dropped , error : %s, %v, packets count : %d", udpEp.Addr, err, n)
+				errs = append(errs, err)
+			}
 		}
+		if len(errs) > 0 {
+			b.failLock.Lock()
+			b.udpFailCount += len(errs)
+			b.failLock.Unlock()
+			return fmt.Errorf("udp send had %d faliures : %v", len(errs), errs[0])
+		}
+		b.failLock.Lock()
+		b.udpFailCount = 0
+		b.failLock.Unlock()
 		return nil
 	}
-	if relayEp, ok := ep.(*RelayEndpoint); ok && b.wsConn != nil {
+	if relayEp, ok := ep.(*RelayEndpoint); ok {
+		if b.wsConn == nil {
+			return fmt.Errorf("relay send failed: wsConn is nil, peer key: %s", hex.EncodeToString(relayEp.Key[:]))
+		}
 		b.wsLock.Lock()
 		defer b.wsLock.Unlock()
 		for _, pkt := range packets {
@@ -165,25 +240,56 @@ func (b *HybridBind) Send(packets [][]byte, ep conn.Endpoint) error {
 		}
 		return nil
 	}
-	return nil
+
+	return fmt.Errorf("unknown endpoint type: %T", ep)
 }
 
 func (b *HybridBind) Receive(packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
-	p, ok := <-b.rxChan
-	if !ok {
+	select {
+	case <-b.closeChan:
 		return 0, errors.New("closed")
+	case p, ok := <-b.rxChan:
+		if !ok {
+			return 0, errors.New("closed")
+		}
+		n := copy(packets[0], p.Data)
+		sizes[0] = n
+		eps[0] = p.Endpoint
+		return 1, nil
 	}
-	n := copy(packets[0], p.Data)
-	sizes[0] = n
-	eps[0] = p.Endpoint
-	return 1, nil
 }
 
 func (b *HybridBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
-	return []conn.ReceiveFunc{b.Receive}, 0, nil
+	b.mu.Lock()
+	if b.isClosed {
+		b.closeChan = make(chan struct{})
+		b.isClosed = false
+	}
+	b.mu.Unlock()
+	return []conn.ReceiveFunc{b.Receive}, uint16(b.udpConn.LocalAddr().(*net.UDPAddr).Port), nil
 }
 func (b *HybridBind) BatchSize() int       { return 1 }
-func (b *HybridBind) Close() error         { return b.udpConn.Close() }
+func (b *HybridBind) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.isClosed {
+		close(b.closeChan)
+		b.isClosed = true
+	}
+	return nil
+}
+
+func (b *HybridBind) Shutdown() {
+	b.Close()
+	if b.udpConn != nil {
+		b.udpConn.Close()
+	}
+	b.wsLock.Lock()
+	if b.wsConn != nil {
+		b.wsConn.Close()
+	}
+	b.wsLock.Unlock()
+}
 func (b *HybridBind) SetMark(uint32) error { return nil }
 
 // --- UPDATED ENDPOINT IMPLEMENTATION ---
@@ -255,4 +361,50 @@ func VerifyProbe(pkt []byte) (string, bool) {
 	peerKeyHex := hex.EncodeToString(peerKeybytes)
 
 	return peerKeyHex, true
+}
+
+const threshold = 5
+
+func (b *HybridBind) IsUdpDead() bool {
+	b.failLock.Lock()
+	defer b.failLock.Unlock()
+	return b.udpFailCount >= threshold
+}
+
+func (b *HybridBind) StartKeepAlives(ctx context.Context, peerAddr *net.UDPAddr) {
+	ticker := time.NewTicker(time.Second * 5)
+	defer ticker.Stop()
+
+	probePkt := make([]byte, 36)
+	binary.BigEndian.PutUint32(probePkt[0:4], MagicProbeSig)
+	copy(probePkt[4:], b.myPubKey[:])
+
+	b.pongLock.Lock()
+	b.lastPongTime = time.Now()
+	b.pongLock.Unlock()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			err := b.SendRaw(probePkt, peerAddr)
+			if err != nil {
+				fmt.Printf("failed to send keepalives to %s : %v\n", peerAddr.String(), err)
+				continue
+			}
+
+			b.pongLock.Lock()
+			lastPong := b.lastPongTime
+			b.pongLock.Unlock()
+
+			if !lastPong.IsZero() && time.Since(lastPong) > 15*time.Second {
+				fmt.Printf("udp peer is dead , lastpongtime > threshold , endpoint : %s", peerAddr.String())
+				b.failLock.Lock()
+				b.udpFailCount = 5
+				b.failLock.Unlock()
+			}
+		}
+	}
+
 }

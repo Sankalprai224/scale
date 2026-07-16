@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -23,7 +24,6 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/pion/stun/v2"
 	"golang.zx2c4.com/wireguard/device"
-	"golang.zx2c4.com/wireguard/ipc"
 	"golang.zx2c4.com/wireguard/tun"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
@@ -38,6 +38,12 @@ var WgDevice *device.Device
 var endpointCache sync.Map
 
 var activeSprayers sync.Map
+
+// activeKeepAlives tracks the cancel func for each peer's running
+// StartKeepAlives loop, keyed by hex peer key, so we don't spawn a
+// duplicate loop on every poll cycle and so we can stop it when the
+// peer disappears or the client shuts down.
+var activeKeepAlives sync.Map
 
 type Endpoint struct {
 	IP       string `json:"ip"`
@@ -72,6 +78,11 @@ var listenPort = 51820
 func main() {
 	if err := godotenv.Load(".env"); err != nil {
 		log.Println("No .env file found, using environment variables.")
+	}
+
+	log.Println("🔍 DEBUG: Testing IP Detection immediately...")
+	if _, err := getLocalIPs(); err != nil {
+		log.Printf("Error getting IPs: %v", err)
 	}
 
 	wgIface := os.Getenv("WG_INTERFACE")
@@ -162,7 +173,7 @@ func main() {
 		}()
 	}
 
-	logger := device.NewLogger(device.LogLevelVerbose, fmt.Sprintf("[%s] ", wgIface))
+	logger := device.NewLogger(device.LogLevelError, fmt.Sprintf("[%s] ", wgIface))
 	WgDevice = device.NewDevice(tunDev, bind, logger)
 	WgDevice.Up()
 
@@ -171,167 +182,205 @@ func main() {
 	}
 
 	conf := fmt.Sprintf(`private_key=%s
-listen_port=%d
-`, hexKey(privKey), listenPort)
+`, hexKey(privKey))
 
-	if err := WgDevice.IpcSet(conf); err != nil {
-		log.Fatalf("Failed to configure device: %v", err)
+	log.Println("Applying WireGuard configuration (private key only)...")
+
+	// Create a channel to catch the result
+	done := make(chan error, 1)
+	go func() {
+		done <- WgDevice.IpcSet(conf)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			log.Fatalf("IpcSet failed: %v", err)
+		}
+		log.Println("applied successfully.")
+	case <-time.After(5 * time.Second):
+		log.Fatal("FATAL: IpcSet timed out ,check hybridbind implementation")
 	}
 
-	//assignIPToInterface(wgIface, regConfig.AssignedIP)
+	//if err := WgDevice.IpcSet(conf); err != nil {
+	//	log.Fatalf("Failed to configure device: %v", err)
+	//}
 
-	uapi, err := ipc.UAPIListen(wgIface, nil)
-	if err != nil {
-		log.Printf("Failed to listen on UAPI socket: %v", err)
-	} else {
-		go func() {
-			for {
-				conn, err := uapi.Accept()
-				if err != nil {
-					continue
+
+	/*
+		uapi, err := ipc.UAPIListen(wgIface, nil)
+		if err != nil {
+			log.Printf("Failed to listen on UAPI socket: %v", err)
+		} else {
+			go func() {
+				for {
+					conn, err := uapi.Accept()
+					if err != nil {
+						continue
+					}
+					go WgDevice.IpcHandle(conn)
 				}
-				go WgDevice.IpcHandle(conn)
-			}
-		}()
-	}
+			}()
+		}
+	*/
+
+	stopChan := make(chan struct{})
 
 	log.Println("Client running. Starting polling loop...")
 
 	go bind.RunControlLoop()
 
-	go runServerPollingLoop(bind, serverURL, pubKey.String(), authToken)
+	go runServerPollingLoop(bind, serverURL, pubKey.String(), authToken, stopChan)
 
-	waitForShutdown()
+	// BUG FIX: HealthMonitor must start before the blocking shutdown wait,
+	// not after. waitForShutdown blocks until SIGINT/SIGTERM, so starting
+	// HealthMonitor after it meant the UDP-dead-detection/relay-failover
+	// loop never ran during normal operation - only at the exact moment
+	// the process was already exiting.
+	go HealthMonitor(bind, stopChan)
+
+	waitForShutdown(stopChan, bind)
 }
 
-func runServerPollingLoop(bind *vpn.HybridBind, serverURL, publicKey, authToken string) {
+func runServerPollingLoop(bind *vpn.HybridBind, serverURL, publicKey, authToken string, stop chan struct{}) {
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 	httpClient := &http.Client{Timeout: 10 * time.Second}
 
 	performPollCycle(bind, httpClient, serverURL, publicKey, authToken)
 
-	for range ticker.C {
-		performPollCycle(bind, httpClient, serverURL, publicKey, authToken)
+	for {
+		select {
+		case <-ticker.C:
+			performPollCycle(bind, httpClient, serverURL, publicKey, authToken)
+		case <-stop:
+			log.Println("Gracefully stopping polling loop...")
+			return
+		}
 	}
 }
 
 func performPollCycle(bind *vpn.HybridBind, client *http.Client, serverURL, publicKey, authToken string) {
+	// 1. Sync state with server
+	mypublicEp, _ := performSTUN(bind, "stun.l.google.com:19302")
+	localEps, _ := getLocalIPs()
+	updateHeartbeat(client, serverURL, publicKey, authToken, mypublicEp, localEps)
 
-	// 1. STUN Check (Get Public IP)
-	mypublicEp, err := performSTUN(bind, "stun.l.google.com:19302")
-	if err != nil {
-		log.Printf("stun failed : %v", err)
-	}
-
-	// 2. Get Local IPs (LAN/Loopback)
-	localEps, err := getLocalIPs()
-	if err != nil {
-		log.Printf("failed to get local ips: %v", err)
-	}
-
-	// 3. Send Heartbeat to Server
-	if err := updateHeartbeat(client, serverURL, publicKey, authToken, mypublicEp, localEps); err != nil {
-		log.Printf("failed to send heartbeat : %v", err)
-	}
-
-	// 4. Poll for Peers
 	pollResp, err := pollServer(client, serverURL, authToken, publicKey)
-	if err != nil {
-		log.Printf("Error polling server: %v", err)
+	if err != nil || pollResp == nil {
 		return
 	}
 
-	var ipcBuilder strings.Builder
+	// Convert YOUR key once
+	selfKeyBytes, _ := wgtypes.ParseKey(publicKey)
+	hexSelfKey := hex.EncodeToString(selfKeyBytes[:])
 
-	// 5. Iterate over Peers
+	var ipcBuilder strings.Builder
+	// MANDATORY: Clear old state and start fresh
+	ipcBuilder.WriteString("replace_peers=true\n")
+
 	for _, peer := range pollResp.Peers {
-		// Skip ourselves
 		if peer.PublicKey == publicKey {
 			continue
 		}
 
-		// --- SMART ENDPOINT SELECTION LOGIC ---
+		// 2. HEX CONVERSION
+		peerKeyBytes, err := wgtypes.ParseKey(peer.PublicKey)
+		if err != nil {
+			log.Printf(" Invalid key %s, skipping", peer.PublicKey[:8])
+			continue
+		}
+		hexPeerKey := hex.EncodeToString(peerKeyBytes[:])
+
+		// 3. IP VALIDATION (The actual fix for Error -22)
+		// Strip any existing mask from peer.ID (e.g., "100.64.0.7/24" -> "100.64.0.7")
+		cleanIP := strings.Split(peer.ID, "/")[0]
+		parsedIP := net.ParseIP(cleanIP)
+		if parsedIP == nil {
+			log.Printf(" Peer %s has invalid IP '%s', skipping", peer.PublicKey[:8], peer.ID)
+			continue
+		}
+
+		// 4. ENDPOINT SELECTION
 		var bestEndpoint Endpoint
 		found := false
-
-		// Priority 1: Look for Localhost (127.0.0.1) - Critical for your current testing!
 		for _, ep := range peer.Endpoints {
-			if strings.HasPrefix(ep.IP, "127.") {
+			if strings.HasPrefix(ep.IP, "192.168.") || strings.HasPrefix(ep.IP, "10.") {
 				bestEndpoint = ep
 				found = true
 				break
 			}
 		}
-
-		// Priority 2: Look for LAN IPs (192.168.x.x, 10.x.x.x) if no localhost
+		// BUG FIX: prefer the STUN-derived public (srflx) endpoint over a
+		// blind index-0 fallback. Without this, a peer's host-enumerated
+		// addresses (e.g. a docker bridge or secondary NIC IP, whatever
+		// happened to be first in the list) could get picked over its
+		// actual reachable public address - fine on a shared LAN where
+		// almost anything routes, but silently wrong once the peer is on
+		// a different network and only the srflx address is reachable.
 		if !found {
 			for _, ep := range peer.Endpoints {
-				if strings.HasPrefix(ep.IP, "192.168.") || strings.HasPrefix(ep.IP, "10.") {
+				if ep.Type == "srflx" {
 					bestEndpoint = ep
 					found = true
 					break
 				}
 			}
 		}
-
-		// Priority 3: Fallback to whatever is first (Usually Public IP)
 		if !found && len(peer.Endpoints) > 0 {
 			bestEndpoint = peer.Endpoints[0]
 			found = true
 		}
 
-		// --- BUILD WIREGUARD CONFIG ---
-		// Write Public Key & Allowed IPs
-		ipcBuilder.WriteString(fmt.Sprintf("public_key=%s\n", peer.PublicKey))
+		// 5. BUILD PEER BLOCK (Atomic String Construction)
+		ipcBuilder.WriteString("public_key=" + hexPeerKey + "\n")
+		ipcBuilder.WriteString("allowed_ip=" + cleanIP + "/32\n")
+		ipcBuilder.WriteString("persistent_keepalive_interval=25\n")
 
-		// Allowed IPs are the VPN IPs (e.g., 100.64.0.x/32)
-		if len(peer.AllowedIPs) > 0 {
-			ipcBuilder.WriteString(fmt.Sprintf("allowed_ips=%s\n", strings.Join(peer.AllowedIPs, ",")))
-		} else {
-			// Fallback if server sent empty allowed_ips (shouldn't happen, but good safety)
-			// ipcBuilder.WriteString(fmt.Sprintf("allowed_ips=%s/32\n", peer.ID))
-		}
-
-		// Set Persistent Keepalive
-		ipcBuilder.WriteString(fmt.Sprintf("persistent_keepalive_interval=%d\n", keepAliveInterval))
-
-		// Set the Endpoint (The IP:Port we connect to)
 		if found {
-			epString := fmt.Sprintf("%s:%d", bestEndpoint.IP, bestEndpoint.Port)
-			ipcBuilder.WriteString(fmt.Sprintf("endpoint=%s\n", epString))
+			if bind.IsUdpDead() {
+				ipcBuilder.WriteString(fmt.Sprintf("endpoint=%s\n", hexPeerKey))
+				log.Printf("🔹 PEER CONNECT (RELAY FALLBACK): %s -> %s (%s/32)", peer.PublicKey[:8], hexPeerKey, cleanIP)
+			} else {
+				ipcBuilder.WriteString(fmt.Sprintf("endpoint=%s:%d\n", bestEndpoint.IP, bestEndpoint.Port))
+				log.Printf("🔹 PEER CONNECT: %s -> %s (%s/32)", peer.PublicKey[:8], bestEndpoint.IP, cleanIP)
+			}
+			endpointCache.Store(hexPeerKey, fmt.Sprintf("%s:%d", bestEndpoint.IP, bestEndpoint.Port))
 
-			// Log it so you can SEE it working
-			log.Printf("🔗 Linking peer %s via %s", peer.PublicKey[:8], epString)
-
-			// Cache it (optional, but good for your hole punching logic)
-			endpointCache.Store(peer.PublicKey, epString)
+			// BUG FIX: bind.StartKeepAlives was never called anywhere in
+			// this file. StartHolePunching only fires a one-shot 5-packet
+			// burst (~750ms) once per 30s poll cycle - not a sustained
+			// keepalive. Without a continuous 5s-interval prober, the
+			// custom ping-pong liveness/roaming mechanism (lastPongTime,
+			// udpFailCount) never gets fed real traffic once the initial
+			// hole-punch burst ends, so it silently stalls - especially
+			// visible when hosting remotely across real NATs, since
+			// LAN/localhost testing doesn't need the mapping kept alive.
+			if udpAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", bestEndpoint.IP, bestEndpoint.Port)); err == nil {
+				if _, alreadyRunning := activeKeepAlives.LoadOrStore(hexPeerKey, true); !alreadyRunning {
+					ctx, cancel := context.WithCancel(context.Background())
+					activeKeepAlives.Store(hexPeerKey, cancel)
+					go bind.StartKeepAlives(ctx, udpAddr)
+				}
+			} else {
+				log.Printf("could not resolve endpoint for keepalive, peer %s: %v", peer.PublicKey[:8], err)
+			}
 		}
 
-		// --- HOLE PUNCHING ---
-		// Fire UDP packets at *all* candidates just in case the "Smart" choice was wrong
-		StartHolePunching(bind, peer.PublicKey, peer.Endpoints, publicKey)
+		// 6. HOLE PUNCHING
+		StartHolePunching(bind, hexPeerKey, peer.Endpoints, hexSelfKey)
 	}
 
-	// 6. Apply Configuration to WireGuard Device
+	// 7. APPLY EVERYTHING AT ONCE
 	if ipcBuilder.Len() > 0 {
-		if err := WgDevice.IpcSet(ipcBuilder.String()); err != nil {
-			log.Printf("Failed to configure peers: %v", err)
+		configBlob := ipcBuilder.String()
+		if err := WgDevice.IpcSet(configBlob); err != nil {
+			log.Printf("❌ IPC Error. Full config attempted:\n%s", configBlob)
+			log.Printf("❌ Detailed Error: %v", err)
 		}
 	}
 }
 
-func assignIPToInterface(iface, cidr string) {
-	cmd := exec.Command("ip", "addr", "add", cidr+"/24", "dev", iface)
-	if err := cmd.Run(); err != nil {
-		log.Printf("Note: IP assignment to %s returned: %v", iface, err)
-	}
-
-	cmdUp := exec.Command("ip", "link", "set", "dev", iface, "up")
-	if err := cmdUp.Run(); err != nil {
-		log.Printf("Failed to bring up interface %s: %v", iface, err)
-	}
-}
 
 func pollServer(client *http.Client, serverURL, authToken, clientPubKey string) (*PollResponse, error) {
 	req, err := http.NewRequest("GET", serverURL+"/api/poll", nil)
@@ -392,17 +441,26 @@ func hexKey(k wgtypes.Key) string {
 	return hex.EncodeToString(k[:])
 }
 
-func waitForShutdown() {
+func waitForShutdown(stopChan chan struct{}, bind *vpn.HybridBind) {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	<-sigCh
 	log.Println("Shutdown signal received.")
+
+	// 1. Tell the polling loop to stop
+	close(stopChan)
+
+	// 2. Close the WireGuard device
 	if WgDevice != nil {
 		WgDevice.Close()
 	}
-}
+	if bind != nil {
+		bind.Shutdown()
+	}
 
-// wireguard/setup.go
+	// 3. Optional: small delay to let goroutines print their "stopping" logs
+	time.Sleep(500 * time.Millisecond)
+}
 
 func performSTUN(bind *vpn.HybridBind, stunServer string) (*Endpoint, error) {
 	serverAddr, err := net.ResolveUDPAddr("udp", stunServer)
@@ -410,22 +468,17 @@ func performSTUN(bind *vpn.HybridBind, stunServer string) (*Endpoint, error) {
 		return nil, err
 	}
 
-	// 1. Build STUN Request using pion/stun
 	msg := stun.MustBuild(stun.BindingRequest, stun.TransactionID)
 
-	// 2. Send using the SAME socket as WireGuard
 	if err := bind.SendRaw(msg.Raw, serverAddr); err != nil {
 		return nil, err
 	}
 
-	// 3. Wait for response on ControlChan
 	timeout := time.After(2 * time.Second)
 	for {
 		select {
 		case pkt := <-bind.StunRxChan:
-			// Is this a STUN packet? (Check magic cookie 0x2112A442)
 			if vpn.VerifyStun(pkt.Data) {
-				// Parse it
 				resp := new(stun.Message)
 				resp.Raw = pkt.Data
 				if err := resp.Decode(); err == nil {
@@ -519,22 +572,16 @@ func loginToServer(serverUrl, email, password string) (string, error) {
 	return token, nil
 }
 
-// StartHolePunching sends Magic Probes to all candidate addresses of a peer.
-// myLocalPubKey: The public key of THIS device (so the peer knows who is knocking).
 func StartHolePunching(bind *vpn.HybridBind, peerKey string, endpoints []Endpoint, myLocalPubKey string) {
 
-	// 1. DEDUP CHECK
-	// If we are already spraying this peer, don't start another gun.
 	if _, loaded := activeSprayers.LoadOrStore(peerKey, true); loaded {
 		return
 	}
 
-	// 2. PARSE CANDIDATES
 	var candidates []*net.UDPAddr
 	for _, ep := range endpoints {
-		// Only target UDP endpoints
+
 		if ep.Protocol == "udp" {
-			// Resolve string "1.2.3.4:51820" -> UDP Address
 			addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", ep.IP, ep.Port))
 			if err == nil {
 				candidates = append(candidates, addr)
@@ -543,21 +590,16 @@ func StartHolePunching(bind *vpn.HybridBind, peerKey string, endpoints []Endpoin
 	}
 
 	if len(candidates) == 0 {
-		activeSprayers.Delete(peerKey) // Cleanup if nothing to do
+		activeSprayers.Delete(peerKey)
 		return
 	}
 
-	// 3. LAUNCH ARTILLERY (Async)
 	go func() {
-		// Ensure we unlock this peer when done
 		defer activeSprayers.Delete(peerKey)
 
-		// A. Construct the Magic Packet
-		// [4 bytes Magic] + [32 bytes My Pub Key]
 		pkt := make([]byte, 36)
 		binary.BigEndian.PutUint32(pkt[:4], vpn.MagicProbeSig)
 
-		// Decode our local key from Hex String to Bytes
 		myKeyBytes, err := hex.DecodeString(myLocalPubKey)
 		if err != nil || len(myKeyBytes) != 32 {
 			log.Printf("Error decoding local key for hole punching: %v", err)
@@ -567,19 +609,14 @@ func StartHolePunching(bind *vpn.HybridBind, peerKey string, endpoints []Endpoin
 
 		log.Printf("Spraying %d candidates for peer %s...", len(candidates), peerKey[:8])
 
-		// B. Fire 5 Rounds
 		for i := 0; i < 5; i++ {
 			for _, addr := range candidates {
-				// Send directly through the WireGuard socket
 				if err := bind.SendRaw(pkt, addr); err != nil {
-					// Ignore errors (fire and forget)
 				}
 			}
-			// Wait 300ms between bursts
 			time.Sleep(150 * time.Millisecond)
 		}
 
-		// log.Printf(" Finished spraying %s", peerKey[:8])
 	}()
 }
 
@@ -596,25 +633,40 @@ func getLocalIPs() ([]Endpoint, error) {
 			case *net.IPAddr:
 				ip = v.IP
 			}
-			//if ip == nil || ip.IsLoopback() || ip.To4() == nil {
-			if ip == nil || ip.To4() == nil {
+
+			isLoopback := ip.IsLoopback()
+			isIPv4 := (ip.To4() != nil)
+			log.Printf("Scanned IP: %s (Loopback: %v, IPv4: %v)", ip.String(), isLoopback, isIPv4)
+
+			if !isIPv4 {
 				continue
 			}
+
+			if isLoopback {
+				continue
+			}
+
 			endpoints = append(endpoints, Endpoint{
 				IP:       ip.String(),
-				Port:     listenPort, // 51820
+				Port:     listenPort,
 				Protocol: "udp",
 				Type:     "host",
 			})
 		}
 	}
+
+	if len(endpoints) == 0 {
+		log.Println("WARNING: No local endpoints found! Client will be invisible to peers.")
+	} else {
+		log.Printf("Sending %d local endpoints to server.", len(endpoints))
+	}
+
 	return endpoints, nil
 }
 
 func ForceConfigureInterface(iface string, ipCIDR string) error {
 	log.Printf("Forcing interface configuration via shell...")
 
-	// 1. Link Up: sudo ip link set dev wg0 up
 	cmdUp := exec.Command("ip", "link", "set", "dev", iface, "up")
 	if out, err := cmdUp.CombinedOutput(); err != nil {
 		return fmt.Errorf("failed to set link up: %v, output: %s", err, out)
@@ -625,11 +677,62 @@ func ForceConfigureInterface(iface string, ipCIDR string) error {
 		fullIP = fullIP + "/32"
 	}
 
-	// 2. Add IP: sudo ip addr add 100.64.0.X/32 dev wg0
-	// We ignore errors here in case the IP is already added (to prevent crashing on restart)
 	cmdAddr := exec.Command("ip", "addr", "add", ipCIDR, "dev", iface)
 	_ = cmdAddr.Run()
 
 	log.Printf("Interface %s configured with IP %s via shell", iface, ipCIDR)
 	return nil
+}
+
+func HealthMonitor(b *vpn.HybridBind, stopChan chan struct{}) {
+	ticker := time.NewTicker(time.Second * 2)
+	defer ticker.Stop()
+
+	usingRelay := false
+
+	for {
+		select {
+		case <-ticker.C:
+			isDead := b.IsUdpDead()
+
+			// BUG FIX: these were nested as an if/else-if under the same
+			// `isDead && !usingRelay` condition, which made the recovery
+			// branch (!isDead && usingRelay) structurally unreachable -
+			// isDead was already known true at that point. They must be
+			// two independent top-level branches.
+			if isDead && !usingRelay {
+				log.Printf("udp failed! shifting to relay")
+
+				var ipcBuilder strings.Builder
+
+				endpointCache.Range(func(key, value interface{}) bool {
+					peerHexKey := key.(string)
+
+					ipcBuilder.WriteString(fmt.Sprintf("public_key=%s\n", peerHexKey))
+					ipcBuilder.WriteString(fmt.Sprintf("endpoint=%s\n", peerHexKey))
+
+					return true
+				})
+
+				if ipcBuilder.Len() > 0 {
+					// BUG FIX: err != nil / err == nil branches were
+					// swapped - a failed IpcSet was marking the switch
+					// as successful, and a successful IpcSet was logging
+					// "failed to switch to relay".
+					if err := WgDevice.IpcSet(ipcBuilder.String()); err != nil {
+						log.Printf("failed to switch to relay: %v", err)
+					} else {
+						usingRelay = true
+						log.Println("switched to relay")
+					}
+				}
+			} else if !isDead && usingRelay {
+				log.Printf("udp recovered, switching back to direct connection")
+				usingRelay = false
+			}
+		case <-stopChan:
+			log.Println("stopping the health monitor")
+			return
+		}
+	}
 }
