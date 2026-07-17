@@ -1,0 +1,21 @@
+# Targeted for AWS EC2 (Ubuntu 24.04)
+[Unit]
+Description=Scale Control Plane
+After=network.target postgresql.service redis-server.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu
+ExecStart=/home/ubuntu/control-plane
+Restart=always
+RestartSec=5
+EnvironmentFile=/home/ubuntu/scale.env
+
+# Optional: Output to syslog
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=scale-control
+
+[Install]
+WantedBy=multi-user.target

@@ -54,7 +54,7 @@ The results demonstrate that the custom userspace WireGuard engine is exceptiona
 **Client:** `iperf3 -c 100.64.181.141 -B 100.64.14.254`
 
 ### Results
-The test achieved a sustained throughput of **40.2 Gbits/sec** (~5 GB/s) over a 10-second interval, demonstrating that the WebSocket fallback incurs virtually zero performance penalty on the loopback interface.
+The test achieved a total average throughput of **40.2 Gbits/sec** (~5 GB/s) over a 10-second interval, but with **severe per-second variance**.
 
 ```text
 Connecting to host 100.64.181.141, port 5201
@@ -79,4 +79,11 @@ iperf Done.
 ```
 
 ### Analysis
-The system successfully detected path failure using the `HealthMonitor` and shifted peer endpoints to the WebSocket relay. The WireGuard engine was able to encapsulate traffic into WebSocket frames and pass them through the relay server flawlessly. The throughput results (40.2 Gbps) indicate that Go's WebSocket implementation and the HybridBind memory management are extremely optimized, limited solely by CPU loopback buffer copying.
+The system successfully detected path failure using the `HealthMonitor` and shifted peer endpoints to the WebSocket relay without dropping the connection. 
+
+**Known Issue - Throughput Instability (Latency Jitter):**
+While the total average throughput matched the UDP benchmark (~40 Gbps), the per-second measurements expose significant instability. Throughput violently dipped to speeds as low as **934 Kbits/sec**, **2.70 Gbits/sec**, and **1.21 Gbits/sec** during specific intervals. 
+
+This extreme variance is a known performance penalty associated with the WebSocket fallback layer at massive speeds. Generating and transmitting 40 Gigabits of WebSocket frames continuously triggers massive memory allocation rates in Go, leading to catastrophic Garbage Collector (GC) pauses ("stop-the-world" events) or TCP window buffer saturation. 
+
+*Future Optimization Goal:* To stabilize this jitter in later versions, the Relay engine and `HybridBind` WebSocket routines need memory-pooling (`sync.Pool`) for byte buffers to minimize heap allocations and relieve GC pressure during high-throughput failover.

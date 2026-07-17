@@ -1,0 +1,21 @@
+# Targeted for AWS EC2 (Ubuntu 24.04)
+[Unit]
+Description=Scale WebSocket Relay Server
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu
+ExecStart=/home/ubuntu/relay
+Restart=always
+RestartSec=5
+EnvironmentFile=/home/ubuntu/scale.env
+
+# Optional: Output to syslog
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=scale-relay
+
+[Install]
+WantedBy=multi-user.target

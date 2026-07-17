@@ -5,3 +5,8 @@ scale-client
 scale-tester
 cert.pem
 key.pem
+deploy/*.env
+deploy/setup_db.sql
+scale-key.pem
+control-plane
+relay
